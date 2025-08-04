@@ -4,25 +4,31 @@ import (
 	"MyRpc/codec"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
 const MagicNumber = 0x3bef5c
 
 // 协商信息，让双方知道怎么读写数据
 type Option struct {
-	MagicNumber int
-	CodecType   codec.Type //head和body所用的编解码格式
+	MagicNumber    int
+	CodecType      codec.Type    //head和body所用的编解码格式
+	ConnectTimeout time.Duration //连接默认时间限制
+	HandleTimeout  time.Duration //处理默认时间限制
 }
 
 var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodecType:   codec.GobType,
+	MagicNumber:    MagicNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeout: time.Second * 10,
 }
 
 type Server struct {
@@ -135,7 +141,7 @@ func (server *Server) serverCodec(cc codec.Codec) {
 		}
 		wg.Add(1)
 		//进行处理操作 在处理函数中直接回复了
-		go server.handleRequest(cc, req, sending, wg)
+		go server.handleRequest(cc, req, sending, wg, 10*time.Second)
 	}
 	wg.Wait()
 	_ = cc.Close()
@@ -196,14 +202,66 @@ func (server *Server) sendRequest(cc codec.Codec, h *codec.Header, body interfac
 		log.Println("rpc server: write response error:", err)
 	}
 }
-func (server *Server) handleRequest(cc codec.Codec, req *request, mu *sync.Mutex, wg *sync.WaitGroup) {
+func (server *Server) handleRequest(cc codec.Codec, req *request, mu *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
-	//直接用服务调用方法
-	err := req.svc.call(req.mtype, req.argv, req.replyv)
-	if err != nil {
-		req.h.Error = err.Error()
-		server.sendRequest(cc, req.h, invalidRequest, mu)
+	//服务调用成功发送的通道
+	called := make(chan struct{})
+	//回复完客户端发送的通道
+	sent := make(chan struct{})
+	go func() {
+		//直接用服务调用方法
+		err := req.svc.call(req.mtype, req.argv, req.replyv)
+		called <- struct{}{}
+		if err != nil {
+			req.h.Error = err.Error()
+			server.sendRequest(cc, req.h, invalidRequest, mu)
+			sent <- struct{}{}
+			return
+		}
+		server.sendRequest(cc, req.h, req.replyv.Interface(), mu)
+		sent <- struct{}{}
+	}()
+	if timeout == 0 {
+		<-called
+		<-sent
 		return
 	}
-	server.sendRequest(cc, req.h, req.replyv.Interface(), mu)
+	select {
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		server.sendRequest(cc, req.h, invalidRequest, mu)
+	case <-called:
+		<-sent
+	}
+}
+
+const (
+	connected        = "200 Connected to Gee RPC"
+	defaultRPCPath   = "/_geeprc_"
+	defaultDebugPath = "/debug/geerpc"
+)
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	//w是响应写入器，r是客户端请求
+	//必须为connect请求
+	if r.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+	//获取底层的网络连接
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc hijacking ", r.RemoteAddr, ": ", err.Error())
+		return
+	}
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+connected+"\n\n")
+	s.ServerConn(conn)
+}
+func (s *Server) HandleHTTP() {
+	http.Handle(defaultRPCPath, s)
+}
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
 }

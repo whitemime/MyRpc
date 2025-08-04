@@ -2,13 +2,18 @@ package myrpc
 
 import (
 	"MyRpc/codec"
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
+	"time"
 )
 
 // 客户端发送的请求以及接收响应的载体
@@ -129,6 +134,21 @@ func (client *Client) receive() {
 	//出现错误
 	client.terminateCalls(err)
 }
+func NewHTTPClient(conn net.Conn, opt *Option) (*Client, error) {
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0\n\n", defaultRPCPath))
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil && resp.Status == connected {
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = errors.New("unexpected HTTP response: " + resp.Status)
+	}
+	return nil, err
+}
+func DialHTTP(network, address string, opts ...*Option) (*Client, error) {
+	return dialTimeout(NewHTTPClient, network, address, opts...)
+}
 func NewClient(conn net.Conn, opt *Option) (*Client, error) {
 	//得先拿到初始化编解码接口的函数
 	f := codec.NewCodecFuncMap[opt.CodecType]
@@ -173,23 +193,50 @@ func parseOptions(opts ...*Option) (*Option, error) {
 	return opt, nil
 }
 
-// 实现一个dial函数（创建一个连接，连接到服务端地址）
-// 正常是返回一个连接实例 我们实现了用连接实例初始化客户端
-func Dial(network, address string, opts ...*Option) (client *Client, err error) {
+type clientResult struct {
+	client *Client
+	err    error
+}
+type newClientFunc func(conn net.Conn, opt *Option) (*Client, error)
+
+// 如果连接创建超时，返回错误
+func dialTimeout(f newClientFunc, network, address string, opts ...*Option) (client *Client, err error) {
 	opt, err := parseOptions(opts...)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := net.Dial(network, address)
+	conn, err := net.DialTimeout(network, address, opt.ConnectTimeout)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		if client == nil {
+		if err != nil {
 			_ = conn.Close()
 		}
 	}()
-	return NewClient(conn, opt)
+	ch := make(chan clientResult)
+	//使用子协程进行创建客户端和接收
+	//使用通道监听是否完成
+	go func() {
+		client, err := f(conn, opt)
+		ch <- clientResult{client: client, err: err}
+	}()
+	if opt.ConnectTimeout == 0 {
+		result := <-ch
+		return result.client, result.err
+	}
+	select {
+	case result := <-ch:
+		return result.client, result.err
+	case <-time.After(opt.ConnectTimeout):
+		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
+	}
+}
+
+// 实现一个dial函数（创建一个连接，连接到服务端地址）
+// 正常是返回一个连接实例 我们实现了用连接实例初始化客户端 又要套一个时间限制
+func Dial(network, address string, opts ...*Option) (client *Client, err error) {
+	return dialTimeout(NewClient, network, address, opts...)
 }
 
 // 完成发送请求
@@ -232,8 +279,30 @@ func (client *Client) Go(serviceMethod string, args, reply interface{}, done cha
 	client.send(call)
 	return call
 }
-func (client *Client) Call(serviceMethod string, args, reply interface{}) error {
+
+// 发送超时交给用户自定义时间
+func (client *Client) Call(ctx context.Context, serviceMethod string, args, reply interface{}) error {
 	//阻塞call.Done，等待响应返回
-	call := <-client.Go(serviceMethod, args, reply, make(chan *Call, 1)).Done
-	return call.Error
+	call := client.Go(serviceMethod, args, reply, make(chan *Call, 1))
+	select {
+	case call := <-call.Done:
+		return call.Error
+	case <-ctx.Done():
+		client.removeCall(call.Seq)
+		return errors.New("rpc client: call failed: " + ctx.Err().Error())
+	}
+}
+func XDial(rpcAddr string, opts ...*Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc client err: wrong format '%s', expect protocol@addr", rpcAddr)
+	}
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		// tcp, unix or other transport protocol
+		return Dial(protocol, addr, opts...)
+	}
 }
